@@ -1,0 +1,114 @@
+From 0f2247c7d92c092fdb568a906df459c6a821b202 Mon Sep 17 00:00:00 2001
+From: zhangzheyuan <zheyuan.zhang@intel.com>
+Date: Wed, 25 Aug 2021 05:59:10 -0400
+Subject: [PATCH] SRF support
+
+---
+ common/base.c           | 17 ++++++++++++-----
+ common/mvreuse_common.h |  1 +
+ encoder/ai_analyse.h    |  4 ++--
+ encoder/analyse.c       |  4 ++--
+ x264.h                  |  4 +++-
+ 5 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/common/base.c b/common/base.c
+index f04da157..b5863ed9 100644
+--- a/common/base.c
++++ b/common/base.c
+@@ -26,7 +26,7 @@
+ 
+ #include "base.h"
+ #include "mvreuse_common.h"
+-
++#include <cpuid.h>
+ #include <ctype.h>
+ 
+ #if HAVE_MALLOC_H
+@@ -751,13 +751,20 @@ REALIGN_STACK int x264_param_default_preset_mvreuse( x264_param_t *param, int i_
+     return 0;
+ }
+ 
+-REALIGN_STACK int detect_avx512()
++REALIGN_STACK int x264_param_default_preset_mvreuse4( x264_param_t *param, int i_jnd_decqp )
++{
++    param_apply_preset_mvreuse4( (void*)param, i_jnd_decqp );
++    return 0;
++}
++
++REALIGN_STACK int detect_mvreuse()
+ {
+     uint32_t cpu = x264_cpu_detect();
+-    if( !(cpu&X264_CPU_AVX512) )
++    uint32_t info[4];
++    __cpuid_count(7, 1, info[0], info[1], info[2], info[3]);
++    if( !(cpu&X264_CPU_AVX512) & !(info[0] & (1<<4)) )
+     {
+-        x264_log_internal( X264_LOG_WARNING, "The current CPU does not support AVX512. Turn off iVTAL algorithm. \n" );
+-        assert(0);
++        x264_log_internal( X264_LOG_WARNING, "The current CPU does not support AVX512 nor SRF. Turn off MV Reuse algorithm. \n" );
+         return 0;
+     }
+     else return 1;
+diff --git a/common/mvreuse_common.h b/common/mvreuse_common.h
+index 6629848f..7ff031f6 100644
+--- a/common/mvreuse_common.h
++++ b/common/mvreuse_common.h
+@@ -38,5 +38,6 @@ typedef struct FrameReuse {
+ } FrameReuse;
+ 
+ void param_apply_preset_mvreuse( void *param, int i_use_remv, int i_jnd_decqp, int framerate, int num_reorder_frames, int i_use_remv_fref, int ref_max, int weighted_pred, int gop_size, int i_keyint_max_infinite, int in_width, int in_height );
++void param_apply_preset_mvreuse4( void *param, int i_jnd_decqp );
+ 
+ #endif
+diff --git a/encoder/ai_analyse.h b/encoder/ai_analyse.h
+index 1100a9d8..6c42b1f3 100644
+--- a/encoder/ai_analyse.h
++++ b/encoder/ai_analyse.h
+@@ -6,8 +6,8 @@
+ 
+ #define ai_sigmoid ai_template(sigmoid)
+ double ai_sigmoid(double x);
+-#define ai_calcVar16x16_avx512 ai_template(calcVar16x16_avx512)
+-int ai_calcVar16x16_avx512(pixel *pCurData, int iPicStride);
++#define ai_calcVar16x16_avx512_srf ai_template(calcVar16x16_avx512_srf)
++int ai_calcVar16x16_avx512_srf(pixel *pCurData, int iPicStride);
+ #define ai_try_fast_sub_inter_p ai_template(try_fast_sub_inter_p)
+ int ai_try_fast_sub_inter_p( int mb_qp, int mb_16x16_cost, int mb_var );
+ #define ai_try_fast_sub_intra_p ai_template(try_fast_sub_intra_p)
+diff --git a/encoder/analyse.c b/encoder/analyse.c
+index f8faa4d7..8b563cd5 100644
+--- a/encoder/analyse.c
++++ b/encoder/analyse.c
+@@ -2965,12 +2965,12 @@ void x264_macroblock_analyse( x264_t *h )
+         if( h->param.b_try_fast_sub_intra_p )
+         {
+             if( h->sh.i_type == SLICE_TYPE_P || h->sh.i_type == SLICE_TYPE_B )
+-                mb_var = ai_calcVar16x16_avx512(h->mb.pic.p_fenc[0], FENC_STRIDE);
++                mb_var = ai_calcVar16x16_avx512_srf(h->mb.pic.p_fenc[0], FENC_STRIDE);
+         }
+         else
+         {
+             if( h->sh.i_type == SLICE_TYPE_P )
+-                mb_var = ai_calcVar16x16_avx512(h->mb.pic.p_fenc[0], FENC_STRIDE);
++                mb_var = ai_calcVar16x16_avx512_srf(h->mb.pic.p_fenc[0], FENC_STRIDE);
+         }
+     }
+ 
+diff --git a/x264.h b/x264.h
+index 04185f1a..c7ab9363 100644
+--- a/x264.h
++++ b/x264.h
+@@ -743,7 +743,9 @@ X264_API int x264_param_default_preset( x264_param_t *, const char *preset, cons
+ 
+ X264_API int x264_param_default_preset_mvreuse( x264_param_t *, int i_use_remv, int i_jnd_decqp, int framerate, int num_reorder_frames, int i_use_remv_fref, int ref_max, int weighted_pred, int gop_size, int i_keyint_max_infinite, int in_width, int in_height );
+ 
+-X264_API int detect_avx512();
++X264_API int x264_param_default_preset_mvreuse4( x264_param_t *, int i_jnd_decqp );
++
++X264_API int detect_mvreuse();
+ 
+ /* x264_param_apply_fastfirstpass:
+  *      If first-pass mode is set (rc.b_stat_read == 0, rc.b_stat_write == 1),
+-- 
+2.39.0
+
