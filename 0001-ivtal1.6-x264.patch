@@ -1,18 +1,18 @@
-From 46bd40b1a195c39235c4829f5567fb1401b87403 Mon Sep 17 00:00:00 2001
+From 37597cf4f227be014e7a1ad8066b83e6a971a3af Mon Sep 17 00:00:00 2001
 From: zhangzheyuan <zheyuan.zhang@intel.com>
 Date: Wed, 25 Aug 2021 05:59:10 -0400
-Subject: [PATCH] IVTAL x264 release/1.0
+Subject: [PATCH] IVTAL x264 release/1.6
 
 ---
  common/ai_common.h                 |  16 +
- common/base.c                      |  92 ++++
+ common/base.c                      | 101 +++-
  common/base.h                      |   1 +
  common/common.h                    |   5 +
  common/frame.c                     |   1 +
  common/frame.h                     |  13 +
  common/macroblock.c                |  12 +-
  common/macroblock.h                |   1 +
- common/mvreuse_common.h            |  42 ++
+ common/mvreuse_common.h            |  46 ++
  common/op_common.h                 |   8 +
  common/op_jnd.h                    |  31 ++
  configure                          |   2 +-
@@ -27,10 +27,10 @@ Subject: [PATCH] IVTAL x264 release/1.0
  encoder/op_encoder.h               |  18 +
  encoder/ratecontrol.c              |   4 +
  encoder/set.c                      |   5 +-
- encoder/slicetype.c                | 737 +++++++++++++++++++-------
+ encoder/slicetype.c                | 748 ++++++++++++++++++++-------
  x264.c                             |   1 +
- x264.h                             |  36 ++
- 26 files changed, 1662 insertions(+), 482 deletions(-)
+ x264.h                             |  38 ++
+ 26 files changed, 1687 insertions(+), 483 deletions(-)
  create mode 100644 common/ai_common.h
  create mode 100644 common/mvreuse_common.h
  create mode 100644 common/op_common.h
@@ -63,17 +63,19 @@ index 00000000..bdca90e2
 +
 +#endif
 diff --git a/common/base.c b/common/base.c
-index c1223273..f04da157 100644
+index c1223273..b5863ed9 100644
 --- a/common/base.c
 +++ b/common/base.c
-@@ -25,6 +25,7 @@
+@@ -25,7 +25,8 @@
   *****************************************************************************/
  
  #include "base.h"
+-
 +#include "mvreuse_common.h"
- 
++#include <cpuid.h>
  #include <ctype.h>
  
+ #if HAVE_MALLOC_H
 @@ -344,9 +345,41 @@ REALIGN_STACK void x264_param_default( x264_param_t *param )
      /* */
      memset( param, 0, sizeof( x264_param_t ) );
@@ -116,7 +118,7 @@ index c1223273..f04da157 100644
      param->i_lookahead_threads = X264_THREADS_AUTO;
      param->b_deterministic = 1;
      param->i_sync_lookahead = X264_SYNC_LOOKAHEAD_AUTO;
-@@ -712,6 +745,24 @@ REALIGN_STACK int x264_param_default_preset( x264_param_t *param, const char *pr
+@@ -712,6 +745,31 @@ REALIGN_STACK int x264_param_default_preset( x264_param_t *param, const char *pr
      return 0;
  }
  
@@ -126,13 +128,20 @@ index c1223273..f04da157 100644
 +    return 0;
 +}
 +
-+REALIGN_STACK int detect_avx512()
++REALIGN_STACK int x264_param_default_preset_mvreuse4( x264_param_t *param, int i_jnd_decqp )
++{
++    param_apply_preset_mvreuse4( (void*)param, i_jnd_decqp );
++    return 0;
++}
++
++REALIGN_STACK int detect_mvreuse()
 +{
 +    uint32_t cpu = x264_cpu_detect();
-+    if( !(cpu&X264_CPU_AVX512) )
++    uint32_t info[4];
++    __cpuid_count(7, 1, info[0], info[1], info[2], info[3]);
++    if( !(cpu&X264_CPU_AVX512) & !(info[0] & (1<<4)) )
 +    {
-+        x264_log_internal( X264_LOG_WARNING, "The current CPU does not support AVX512. Turn off iVTAL algorithm. \n" );
-+        assert(0);
++        x264_log_internal( X264_LOG_WARNING, "The current CPU does not support AVX512 nor SRF. Turn off MV Reuse algorithm. \n" );
 +        return 0;
 +    }
 +    else return 1;
@@ -141,7 +150,7 @@ index c1223273..f04da157 100644
  REALIGN_STACK void x264_param_apply_fastfirstpass( x264_param_t *param )
  {
      /* Set faster options in case of turbo firstpass. */
-@@ -956,6 +1007,13 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
+@@ -956,6 +1014,13 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
          else
              p->i_threads = atoi(value);
      }
@@ -155,7 +164,7 @@ index c1223273..f04da157 100644
      OPT("lookahead-threads")
      {
          if( !strcasecmp(value, "auto") )
-@@ -1392,6 +1450,40 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
+@@ -1392,6 +1457,40 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
          CHECKED_ERROR_PARAM_STRDUP( p->psz_clbin_file, p, value );
      OPT("opencl-device")
          p->i_opencl_device = atoi( value );
@@ -325,10 +334,10 @@ index 42e55181..72dc6915 100644
  enum mb_class_e
 diff --git a/common/mvreuse_common.h b/common/mvreuse_common.h
 new file mode 100644
-index 00000000..6629848f
+index 00000000..db4daa75
 --- /dev/null
 +++ b/common/mvreuse_common.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,46 @@
 +#ifndef MVREUSE_COMMON_H
 +#define MVREUSE_COMMON_H
 +
@@ -364,11 +373,15 @@ index 00000000..6629848f
 +    int is_dup_frame;
 +    int framerate;
 +    float i_frame_avg_qp_aq;
++    int output_stream_count;
++    int output_stream_drop_count;
++    int output_stream_num;
 +    MVReuse myMb[300][300];
 +    MVReuse myMb_resize[300][300];
 +} FrameReuse;
 +
 +void param_apply_preset_mvreuse( void *param, int i_use_remv, int i_jnd_decqp, int framerate, int num_reorder_frames, int i_use_remv_fref, int ref_max, int weighted_pred, int gop_size, int i_keyint_max_infinite, int in_width, int in_height );
++void param_apply_preset_mvreuse4( void *param, int i_jnd_decqp );
 +
 +#endif
 diff --git a/common/op_common.h b/common/op_common.h
@@ -387,7 +400,7 @@ index 00000000..c377b25f
 +#endif
 diff --git a/common/op_jnd.h b/common/op_jnd.h
 new file mode 100644
-index 00000000..c9e3dbd1
+index 00000000..f66a1080
 --- /dev/null
 +++ b/common/op_jnd.h
 @@ -0,0 +1,31 @@
@@ -412,10 +425,10 @@ index 00000000..c9e3dbd1
 +
 +#define op_jnd_avx512 op_template(jnd_avx512)
 +void op_jnd_avx512( int width, int height, int stride[], FrameReuse *myFrame, pixel* yuv_plane[],
-+                     pixel *dst, int dst_stride, uint8_t *src, int src_stride, UnsharpFilterParamIvtal fp, int i_jnd_sharp, int threads );
++                     pixel *dst, int dst_stride, uint8_t *src, int src_stride, UnsharpFilterParamIvtal* fp, int i_jnd_sharp, int threads );
 +#define op_jnd_sharp_avx512 op_template(jnd_sharp_avx512)
 +void op_jnd_sharp_avx512( int width, int height, int stride[], FrameReuse *myFrame, pixel* yuv_plane[],
-+                     pixel *dst, int dst_stride, uint8_t *src, int src_stride, UnsharpFilterParamIvtal fp, int i_jnd_sharp, int threads );
++                     pixel *dst, int dst_stride, uint8_t *src, int src_stride, UnsharpFilterParamIvtal* fp, int i_jnd_sharp, int threads );
 +#define op_jnd_set_param_ivtal op_template(jnd_set_param_ivtal)
 +void op_jnd_set_param_ivtal(UnsharpFilterParamIvtal* fp, int i_width);
 +#define op_jnd_free_param_ivtal op_template(jnd_free_param_ivtal)
@@ -437,7 +450,7 @@ index b4426d62..e72ebb22 100755
  EOF
 diff --git a/encoder/ai_analyse.h b/encoder/ai_analyse.h
 new file mode 100644
-index 00000000..1100a9d8
+index 00000000..6c42b1f3
 --- /dev/null
 +++ b/encoder/ai_analyse.h
 @@ -0,0 +1,16 @@
@@ -449,8 +462,8 @@ index 00000000..1100a9d8
 +
 +#define ai_sigmoid ai_template(sigmoid)
 +double ai_sigmoid(double x);
-+#define ai_calcVar16x16_avx512 ai_template(calcVar16x16_avx512)
-+int ai_calcVar16x16_avx512(pixel *pCurData, int iPicStride);
++#define ai_calcVar16x16_avx512_srf ai_template(calcVar16x16_avx512_srf)
++int ai_calcVar16x16_avx512_srf(pixel *pCurData, int iPicStride);
 +#define ai_try_fast_sub_inter_p ai_template(try_fast_sub_inter_p)
 +int ai_try_fast_sub_inter_p( int mb_qp, int mb_16x16_cost, int mb_var );
 +#define ai_try_fast_sub_intra_p ai_template(try_fast_sub_intra_p)
@@ -458,7 +471,7 @@ index 00000000..1100a9d8
 +
 +#endif
 diff --git a/encoder/analyse.c b/encoder/analyse.c
-index 5e32e223..f8faa4d7 100644
+index 5e32e223..8b563cd5 100644
 --- a/encoder/analyse.c
 +++ b/encoder/analyse.c
 @@ -28,6 +28,9 @@
@@ -647,12 +660,12 @@ index 5e32e223..f8faa4d7 100644
 +        if( h->param.b_try_fast_sub_intra_p )
 +        {
 +            if( h->sh.i_type == SLICE_TYPE_P || h->sh.i_type == SLICE_TYPE_B )
-+                mb_var = ai_calcVar16x16_avx512(h->mb.pic.p_fenc[0], FENC_STRIDE);
++                mb_var = ai_calcVar16x16_avx512_srf(h->mb.pic.p_fenc[0], FENC_STRIDE);
 +        }
 +        else
 +        {
 +            if( h->sh.i_type == SLICE_TYPE_P )
-+                mb_var = ai_calcVar16x16_avx512(h->mb.pic.p_fenc[0], FENC_STRIDE);
++                mb_var = ai_calcVar16x16_avx512_srf(h->mb.pic.p_fenc[0], FENC_STRIDE);
 +        }
 +    }
 +
@@ -1487,7 +1500,7 @@ index 5e32e223..f8faa4d7 100644
              if( analysis.i_mbrd )
              {
 diff --git a/encoder/encoder.c b/encoder/encoder.c
-index d4ddfa0c..888af6fe 100644
+index d4ddfa0c..81aa4e63 100644
 --- a/encoder/encoder.c
 +++ b/encoder/encoder.c
 @@ -26,6 +26,11 @@
@@ -1662,14 +1675,14 @@ index d4ddfa0c..888af6fe 100644
 +        if( h->param.i_jnd_decqp )
 +        {
 +            op_jnd_avx512( h->param.i_width, h->param.i_height, pic_in->img.i_stride, fenc->myFrame, (pixel**)pic_in->img.plane,
-+                            fenc->plane[0], fenc->i_stride[0], pic_in->img.plane[0], pic_in->img.i_stride[0], fp, h->param.i_jnd_sharp, h->param.i_jnd_threads );
++                            fenc->plane[0], fenc->i_stride[0], pic_in->img.plane[0], pic_in->img.i_stride[0], &fp, h->param.i_jnd_sharp, h->param.i_jnd_threads );
 +        }
 +        else
 +        {
 +            if(h->param.i_jnd_sharp)
 +            {
 +                op_jnd_sharp_avx512( h->param.i_width, h->param.i_height, pic_in->img.i_stride, fenc->myFrame, (pixel**)pic_in->img.plane,
-+                            fenc->plane[0], fenc->i_stride[0], pic_in->img.plane[0], pic_in->img.i_stride[0], fp, h->param.i_jnd_sharp, h->param.i_jnd_threads );
++                            fenc->plane[0], fenc->i_stride[0], pic_in->img.plane[0], pic_in->img.i_stride[0], &fp, h->param.i_jnd_sharp, h->param.i_jnd_threads );
 +            }
 +        }
 +
@@ -1731,21 +1744,21 @@ index d4ddfa0c..888af6fe 100644
          h->fdec->i_dts = h->i_frame > h->frames.i_bframe_delay
                         ? prev_reordered_pts[ (h->i_frame - h->frames.i_bframe_delay) % h->frames.i_bframe_delay ]
                         : h->fenc->i_reordered_pts - h->frames.i_bframe_delay_time;
-@@ -3955,6 +4059,15 @@ static int encoder_frame_end( x264_t *h, x264_t *thread_current,
-     /* Set output picture properties */
-     pic_out->i_type = h->fenc->i_type;
- 
-+    if( h->param.i_use_remv )
-+    {
-+        if( h->fenc->out_stream_id == (out_stream_count - 1) )
-+        {
-+            free( h->fenc->myFrame );
-+            pic_out->myFrame = h->fenc->myFrame = NULL;
-+        }
-+    }
-+
+@@ -3958,6 +4062,15 @@ static int encoder_frame_end( x264_t *h, x264_t *thread_current,
      pic_out->b_keyframe = h->fenc->b_keyframe;
      pic_out->i_pic_struct = h->fenc->i_pic_struct;
+ 
++    pic_out->myFrame = h->fenc->myFrame;
++
++    if ( pic_out->myFrame )
++    {
++        pic_out->myFrame->output_stream_count++;
++        if ( pic_out->myFrame->output_stream_count == (pic_out->myFrame->output_stream_num - pic_out->myFrame->output_stream_drop_count) )
++            free(pic_out->myFrame);
++    }
++
+     pic_out->i_pts = h->fdec->i_pts;
+     pic_out->i_dts = h->fdec->i_dts;
  
 @@ -4514,11 +4627,17 @@ void    x264_encoder_close  ( x264_t *h )
          }
@@ -2101,7 +2114,7 @@ index ec79985c..4b7f1231 100644
       * order of forgetting old pictures */
      sps->vui.i_max_dec_frame_buffering =
 diff --git a/encoder/slicetype.c b/encoder/slicetype.c
-index 0315ba6b..2f7dc740 100644
+index 0315ba6b..3c8f0db5 100644
 --- a/encoder/slicetype.c
 +++ b/encoder/slicetype.c
 @@ -28,6 +28,8 @@
@@ -2271,10 +2284,7 @@ index 0315ba6b..2f7dc740 100644
 -            memset( frames[middle]->i_propagate_cost, 0, h->mb.i_mb_count * sizeof(uint16_t) );
 -            while( i > cur_nonb )
 +            if (h->param.i_hierarchy_bframe)
-             {
--                int p0 = i > middle ? middle : cur_nonb;
--                int p1 = i < middle ? middle : last_nonb;
--                if( i != middle )
++            {
 +                int blayers;
 +                int** record;//record the bframe and its feference
 +                int* count;//count <= (bframes + 1) * 2 the count of bframes of a b-layer
@@ -2284,22 +2294,19 @@ index 0315ba6b..2f7dc740 100644
 +                    record[mal] = malloc(maxb * sizeof(int));
 +                    memset(record[mal], 0, maxb * sizeof(int));
 +                }
-+                count = malloc(bframes * sizeof(int));
-+                memset(count, 0, bframes * sizeof(int));
++                count = malloc((bframes+2) * sizeof(int));
++                memset(count, 0, (bframes+2) * sizeof(int));
 +                countin[0] = 0;
 +
 +                blayers = op_mbtree_hierarchy_bframe( (void **)frames, cur_nonb + 1, last_nonb - 1, 1, record, count, recordbref, countin);
 +                // record[1-3][] middle left(curnonb) right(lastnonb)
 +                for (int bl = 1; bl < blayers; bl++)
-                 {
--                    slicetype_frame_cost( h, a, frames, p0, p1, i );
--                    macroblock_tree_propagate( h, frames, average_duration, p0, p1, i, 0 );
++                {
 +                    for (int cnt = 1; cnt <= count[bl]; cnt++) {
 +                        slicetype_frame_cost(h, a, frames, record[3*cnt-1][bl], record[3*cnt][bl], record[3*cnt-2][bl]);
 +                        memset(frames[record[3*cnt-2][bl]]->i_propagate_cost, 0, h->mb.i_mb_count * sizeof(uint16_t) );
 +                    }
-                 }
--                i--;
++                }
 +                for (int cnt = 1; cnt <= count[blayers]; cnt++) {
 +                    slicetype_frame_cost(h, a, frames, record[3*cnt-1][blayers], record[3*cnt][blayers], record[3*cnt-2][blayers]);
 +                    macroblock_tree_propagate( h, frames, average_duration, record[3*cnt-1][blayers], record[3*cnt][blayers], record[3*cnt-2][blayers], 0);
@@ -2319,12 +2326,17 @@ index 0315ba6b..2f7dc740 100644
 +                i = cur_nonb;
 +            }
 +            else
-+            {
+             {
+-                int p0 = i > middle ? middle : cur_nonb;
+-                int p1 = i < middle ? middle : last_nonb;
+-                if( i != middle )
 +                int middle = (bframes + 1)/2 + cur_nonb;
 +                slicetype_frame_cost( h, a, frames, cur_nonb, last_nonb, middle );
 +                memset( frames[middle]->i_propagate_cost, 0, h->mb.i_mb_count * sizeof(uint16_t) );
 +                while( i > cur_nonb )
-+                {
+                 {
+-                    slicetype_frame_cost( h, a, frames, p0, p1, i );
+-                    macroblock_tree_propagate( h, frames, average_duration, p0, p1, i, 0 );
 +                    int p0 = i > middle ? middle : cur_nonb;
 +                    int p1 = i < middle ? middle : last_nonb;
 +                    if( i != middle )
@@ -2333,7 +2345,8 @@ index 0315ba6b..2f7dc740 100644
 +                        macroblock_tree_propagate( h, frames, average_duration, p0, p1, i, 0 );
 +                    }
 +                    i--;
-+                }
+                 }
+-                i--;
 +                macroblock_tree_propagate( h, frames, average_duration, cur_nonb, last_nonb, middle, 1 );
              }
 -            macroblock_tree_propagate( h, frames, average_duration, cur_nonb, last_nonb, middle, 1 );
@@ -2408,7 +2421,7 @@ index 0315ba6b..2f7dc740 100644
  }
  
  static int vbv_frame_cost( x264_t *h, x264_mb_analysis_t *a, x264_frame_t **frames, int p0, int p1, int b )
-@@ -1519,157 +1673,249 @@ void x264_slicetype_analyse( x264_t *h, int intra_minigop )
+@@ -1519,157 +1673,260 @@ void x264_slicetype_analyse( x264_t *h, int intra_minigop )
          return;
      }
  
@@ -2427,6 +2440,7 @@ index 0315ba6b..2f7dc740 100644
 -#if HAVE_OPENCL
 -    x264_opencl_slicetype_prep( h, frames, num_frames, a.i_lambda );
 -#endif
++        int bframe_count = 0;
 +        for( int j = 1; j <= num_frames; j++ )
 +        {
 +            if( frames[j]->i_type != X264_TYPE_AUTO )
@@ -2441,7 +2455,6 @@ index 0315ba6b..2f7dc740 100644
 +            frm_remv = frames[j];
 +            frm_remv->needDecideB = !mvreuse_is_dup_frame( frm_remv->myFrame->is_dup_frame );
 +            frm_remv->i_type = mvreuse_decide_slice_type( h->param.b_open_gop, frm_remv->myFrame, h->param.i_use_remv_I );
-+        }
  
 -    /* Close GOP at IDR-frames */
 -    for( int j = 2; j <= num_frames; j++ )
@@ -2449,11 +2462,25 @@ index 0315ba6b..2f7dc740 100644
 -        if( frames[j]->i_type == X264_TYPE_IDR && IS_X264_TYPE_AUTO_OR_B( frames[j-1]->i_type ) )
 -            frames[j-1]->i_type = X264_TYPE_P;
 -    }
-+        if( h->param.i_use_remv_I )
-+        {
++            if ( frm_remv->i_type == X264_TYPE_B || frm_remv->i_type == X264_TYPE_BREF)
++                bframe_count++;
++            else
++                bframe_count = 0;
++            if ( bframe_count > X264_BFRAME_MAX )
++            {
++                frm_remv->i_type = X264_TYPE_P;
++                bframe_count = 0;
++            }
++        }
  
 -    int num_analysed_frames = num_frames;
 -    int reset_start;
++        if( h->param.i_use_remv_I )
++        {
+ 
+-    if( h->param.i_bframe )
+-    {
+-        if( h->param.i_bframe_adaptive == X264_B_ADAPT_TRELLIS )
 +            if( h->param.i_bframe )
 +            {
 +                if( IS_X264_TYPE_AUTO_OR_B( frames[num_frames]->i_type ) )
@@ -2465,42 +2492,39 @@ index 0315ba6b..2f7dc740 100644
 +                    if( IS_X264_TYPE_AUTO_OR_B( frames[j]->i_type ) )
 +                        frames[j]->i_type = X264_TYPE_P;
 +            }
- 
--    if( h->param.i_bframe )
--    {
--        if( h->param.i_bframe_adaptive == X264_B_ADAPT_TRELLIS )
++
 +            reset_start = num_frames;
 +        }
 +        else
          {
 -            if( num_frames > 1 )
 +            if( h->param.i_scenecut_threshold && scenecut( h, &a, frames, 0, 1, 1, orig_num_frames, i_max_search ) )
-+            {
-+                frames[1]->i_type = X264_TYPE_I;
-+                return;
-+            }
-+
-+            /* Replace forced keyframes with I/IDR-frames */
-+            for( int j = 1; j <= num_frames; j++ )
              {
 -                char best_paths[X264_BFRAME_MAX+1][X264_LOOKAHEAD_MAX+1] = {"","P"};
 -                int best_path_index = num_frames % (X264_BFRAME_MAX+1);
-+                if( frames[j]->i_type == X264_TYPE_KEYFRAME )
-+                    frames[j]->i_type = h->param.b_open_gop ? X264_TYPE_I : X264_TYPE_IDR;
++                frames[1]->i_type = X264_TYPE_I;
++                return;
 +            }
  
 -                /* Perform the frametype analysis. */
 -                for( int j = 2; j <= num_frames; j++ )
 -                    slicetype_path( h, &a, frames, j, best_paths );
++            /* Replace forced keyframes with I/IDR-frames */
++            for( int j = 1; j <= num_frames; j++ )
++            {
++                if( frames[j]->i_type == X264_TYPE_KEYFRAME )
++                    frames[j]->i_type = h->param.b_open_gop ? X264_TYPE_I : X264_TYPE_IDR;
++            }
+ 
+-                /* Load the results of the analysis into the frame types. */
+-                for( int j = 1; j < num_frames; j++ )
 +            /* Close GOP at IDR-frames */
 +            for( int j = 2; j <= num_frames; j++ )
 +            {
 +                if( frames[j]->i_type == X264_TYPE_IDR && IS_X264_TYPE_AUTO_OR_B( frames[j-1]->i_type ) )
 +                    frames[j-1]->i_type = X264_TYPE_P;
 +            }
- 
--                /* Load the results of the analysis into the frame types. */
--                for( int j = 1; j < num_frames; j++ )
++
 +            if( h->param.i_bframe )
 +            {
 +                int num_analysed_frames = num_frames;
@@ -2517,14 +2541,14 @@ index 0315ba6b..2f7dc740 100644
 +                for( int j = 1; j < num_bframes+1; j++ )
                  {
 -                    if( best_paths[best_path_index][j-1] != 'B' )
-+                    if( frames[j]->i_forced_type == X264_TYPE_AUTO && IS_X264_TYPE_AUTO_OR_I( frames[j+1]->i_forced_type ) &&
-+                        h->param.i_scenecut_threshold && scenecut( h, &a, frames, j, j+1, 0, orig_num_frames, i_max_search ) )
-                     {
+-                    {
 -                        if( IS_X264_TYPE_AUTO_OR_B( frames[j]->i_type ) )
 -                            frames[j]->i_type = X264_TYPE_P;
 -                    }
 -                    else
--                    {
++                    if( frames[j]->i_forced_type == X264_TYPE_AUTO && IS_X264_TYPE_AUTO_OR_I( frames[j+1]->i_forced_type ) &&
++                        h->param.i_scenecut_threshold && scenecut( h, &a, frames, j, j+1, 0, orig_num_frames, i_max_search ) )
+                     {
 -                        if( frames[j]->i_type == X264_TYPE_AUTO )
 -                            frames[j]->i_type = X264_TYPE_B;
 +                        frames[j]->i_type = X264_TYPE_P;
@@ -2772,7 +2796,7 @@ index 0315ba6b..2f7dc740 100644
      }
  
      /* Perform the actual macroblock tree analysis.
-@@ -1800,76 +2046,132 @@ void x264_slicetype_decide( x264_t *h )
+@@ -1800,76 +2057,132 @@ void x264_slicetype_decide( x264_t *h )
      {
          frm = h->lookahead->next.list[bframes];
  
@@ -2844,7 +2868,9 @@ index 0315ba6b..2f7dc740 100644
 -            if( warn )
 +            /* Limit GOP size */
 +            if( (!h->param.b_intra_refresh || frm->i_frame == 0) && frm->i_frame - h->lookahead->i_last_keyframe >= h->param.i_keyint_max )
-+            {
+             {
+-                x264_log( h, X264_LOG_WARNING, "specified frame type (%d) at %d is not compatible with keyframe interval\n", frm->i_type, frm->i_frame );
+-                frm->i_type = h->param.b_open_gop && h->lookahead->i_last_keyframe >= 0 ? X264_TYPE_I : X264_TYPE_IDR;
 +                if( frm->i_type == X264_TYPE_AUTO || frm->i_type == X264_TYPE_I )
 +                    frm->i_type = h->param.b_open_gop && h->lookahead->i_last_keyframe >= 0 ? X264_TYPE_I : X264_TYPE_IDR;
 +                int warn = frm->i_type != X264_TYPE_IDR;
@@ -2869,9 +2895,7 @@ index 0315ba6b..2f7dc740 100644
 +                    frm->i_type = X264_TYPE_IDR;
 +            }
 +            if( frm->i_type == X264_TYPE_IDR )
-             {
--                x264_log( h, X264_LOG_WARNING, "specified frame type (%d) at %d is not compatible with keyframe interval\n", frm->i_type, frm->i_frame );
--                frm->i_type = h->param.b_open_gop && h->lookahead->i_last_keyframe >= 0 ? X264_TYPE_I : X264_TYPE_IDR;
++            {
 +                /* Close GOP */
 +                h->lookahead->i_last_keyframe = frm->i_frame;
 +                frm->b_keyframe = 1;
@@ -2955,7 +2979,7 @@ index 0315ba6b..2f7dc740 100644
              if( frm->i_type == X264_TYPE_AUTO
                  || IS_X264_TYPE_B( frm->i_type ) )
                  frm->i_type = X264_TYPE_P;
-@@ -1888,11 +2190,43 @@ void x264_slicetype_decide( x264_t *h )
+@@ -1888,11 +2201,43 @@ void x264_slicetype_decide( x264_t *h )
          h->lookahead->next.list[bframes-1]->b_last_minigop_bframe = 1;
      h->lookahead->next.list[bframes]->i_bframes = bframes;
  
@@ -2963,7 +2987,7 @@ index 0315ba6b..2f7dc740 100644
 -    if( h->param.i_bframe_pyramid && bframes > 1 && !brefs )
 +    if( h->param.i_use_remv > 1 && brefs > 1 && !h->param.i_hierarchy_bframe )
 +    {
-+        x264_log( h, X264_LOG_ERROR, " hierarchy-B structure is detected in the decoding process, You should turn on hierarchy-bframe=1 or set mvreuse < 2\n" );
++        x264_log( h, X264_LOG_ERROR, " hierarchy-B structure is detected in the decoding process, You should turn on hierarchy-bframe=1 or set mvreuse 1 & 4\n" );
 +        assert(0);
 +    }
 +
@@ -3003,7 +3027,7 @@ index 0315ba6b..2f7dc740 100644
      }
  
      /* calculate the frame costs ahead of time for x264_rc_analyse_slice while we still have lowres */
-@@ -1947,16 +2281,31 @@ void x264_slicetype_decide( x264_t *h )
+@@ -1947,16 +2292,31 @@ void x264_slicetype_decide( x264_t *h )
      int i_coded = h->lookahead->next.list[0]->i_frame;
      if( bframes )
      {
@@ -3056,7 +3080,7 @@ index 747bf3c9..b7a826d8 100644
  };
  
 diff --git a/x264.h b/x264.h
-index d685efbd..04185f1a 100644
+index d685efbd..c7ab9363 100644
 --- a/x264.h
 +++ b/x264.h
 @@ -79,6 +79,10 @@ extern "C" {
@@ -3110,18 +3134,20 @@ index d685efbd..04185f1a 100644
      int b_opencl;            /* use OpenCL when available */
      int i_opencl_device;     /* specify count of GPU devices to skip, for CLI users */
      void *opencl_device_id;  /* pass explicit cl_device_id as void*, for API users */
-@@ -711,6 +741,10 @@ static const char * const x264_tune_names[] = { "film", "animation", "grain", "s
+@@ -711,6 +741,12 @@ static const char * const x264_tune_names[] = { "film", "animation", "grain", "s
   *      returns 0 on success, negative on failure (e.g. invalid preset/tune name). */
  X264_API int x264_param_default_preset( x264_param_t *, const char *preset, const char *tune );
  
 +X264_API int x264_param_default_preset_mvreuse( x264_param_t *, int i_use_remv, int i_jnd_decqp, int framerate, int num_reorder_frames, int i_use_remv_fref, int ref_max, int weighted_pred, int gop_size, int i_keyint_max_infinite, int in_width, int in_height );
 +
-+X264_API int detect_avx512();
++X264_API int x264_param_default_preset_mvreuse4( x264_param_t *, int i_jnd_decqp );
++
++X264_API int detect_mvreuse();
 +
  /* x264_param_apply_fastfirstpass:
   *      If first-pass mode is set (rc.b_stat_read == 0, rc.b_stat_write == 1),
   *      modify the encoder settings to disable options generally not useful on
-@@ -895,6 +929,8 @@ typedef struct x264_picture_t
+@@ -895,6 +931,8 @@ typedef struct x264_picture_t
      x264_sei_t extra_sei;
      /* private user data. copied from input to output frames. */
      void *opaque;
@@ -3131,5 +3157,5 @@ index d685efbd..04185f1a 100644
  
  /* x264_picture_init:
 -- 
-2.27.0
+2.43.0
 
