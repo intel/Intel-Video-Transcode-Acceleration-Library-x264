@@ -1,7 +1,7 @@
 From 37597cf4f227be014e7a1ad8066b83e6a971a3af Mon Sep 17 00:00:00 2001
 From: zhangzheyuan <zheyuan.zhang@intel.com>
 Date: Wed, 25 Aug 2021 05:59:10 -0400
-Subject: [PATCH] IVTAL x264 release/1.6
+Subject: [PATCH] IVTAL x264 release/2.0
 
 ---
  common/ai_common.h                 |  16 +
